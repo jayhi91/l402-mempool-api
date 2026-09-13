@@ -3,32 +3,39 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="L402 Dynamic Mempool Data API")
+app = FastAPI(title="L402 Live Mempool API")
 
 ALBY_ACCESS_TOKEN = os.getenv("ALBY_ACCESS_TOKEN")
-MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
-MEMPOOL_FEES_URL = "https://mempool.space/api/v1/fees/recommended"
-MEMPOOL_STATS_URL = "https://mempool.space/api/mempool"
+async def create_alby_invoice(amount_sats: int = 10):
+    """Generates a mainnet invoice from Alby Hub."""
+    url = "https://api.getalby.com/invoices"
+    headers = {
+        "Authorization": f"Bearer {ALBY_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "amount": amount_sats,
+        "description": "L402 Telemetry Payment"
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data.get("payment_request")
 
 async def get_live_mempool_data():
+    """Fetches real-time fee and mempool statistics from mempool.space."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        fees_resp = await client.get(MEMPOOL_FEES_URL)
-        stats_resp = await client.get(MEMPOOL_STATS_URL)
+        fees_resp = await client.get("https://mempool.space/api/v1/fees/recommended")
+        stats_resp = await client.get("https://mempool.space/api/mempool")
 
         fees = fees_resp.json() if fees_resp.status_code == 200 else {}
         stats = stats_resp.json() if stats_resp.status_code == 200 else {}
 
-    # Simple congestion rating based on fastest fee rate
     fastest = fees.get("fastestFee", 0)
-    if fastest > 50:
-        congestion = "EXTREME_CONGESTION"
-    elif fastest > 20:
-        congestion = "HIGH_CONGESTION"
-    elif fastest > 10:
-        congestion = "MODERATE_CONGESTION"
-    else:
-        congestion = "LOW_CONGESTION"
+    congestion = "EXTREME" if fastest > 50 else "HIGH" if fastest > 20 else "MODERATE" if fastest > 10 else "LOW"
 
     return {
         "status": "success",
@@ -48,23 +55,27 @@ async def get_live_mempool_data():
 
 @app.get("/api/v1/mempool-signal")
 async def get_mempool_signal(authorization: str = Header(None)):
-    # 1. Verify L402 Auth Header
+    # 1. Unauthenticated: Return 402 with real Alby invoice
     if not authorization or not authorization.startswith("L402 "):
-        # In a full setup, generate dynamic invoice via Alby REST API
-        # Return 402 challenge if header is missing or unverified
+        invoice = await create_alby_invoice(10)
+        if not invoice:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Failed to generate Lightning invoice from Alby Hub."}
+            )
         return JSONResponse(
             status_code=402,
-            headers={"WWW-Authenticate": 'L402 invoice="lnbc..."'},
+            headers={"WWW-Authenticate": f'L402 invoice="{invoice}"'},
             content={
                 "error": "Payment Required",
                 "cost_sats": 10,
-                "message": "Send 10 sats to receive live mempool telemetry."
+                "invoice": invoice
             }
         )
 
-    # 2. Fetch real-time data from mempool.space once authenticated
+    # 2. Authenticated: Fetch live mempool.space data
     try:
-        live_data = await get_live_mempool_data()
-        return live_data
+        return await get_live_mempool_data()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch live feed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch live data: {str(e)}")
+
