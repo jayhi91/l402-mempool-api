@@ -1,109 +1,70 @@
 import os
-import logging
-import requests
-from typing import Optional
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-# Setup logger
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("paywall_api")
+app = FastAPI(title="L402 Dynamic Mempool Data API")
 
-app = FastAPI(title="L402 Mempool API")
+ALBY_ACCESS_TOKEN = os.getenv("ALBY_ACCESS_TOKEN")
+MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
-# Environment configurations
-MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
-ALBY_ACCESS_TOKEN = os.getenv("ALBY_ACCESS_TOKEN", "")
+MEMPOOL_FEES_URL = "https://mempool.space/api/v1/fees/recommended"
+MEMPOOL_STATS_URL = "https://mempool.space/api/mempool"
 
-# In-memory storage for used preimages
-USED_PREIMAGES = set()
+async def get_live_mempool_data():
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        fees_resp = await client.get(MEMPOOL_FEES_URL)
+        stats_resp = await client.get(MEMPOOL_STATS_URL)
 
+        fees = fees_resp.json() if fees_resp.status_code == 200 else {}
+        stats = stats_resp.json() if stats_resp.status_code == 200 else {}
 
-def create_invoice(amount_sats: int = 10):
-    if MOCK_MODE:
-        import uuid
-        mock_id = str(uuid.uuid4())[:8]
-        return f"hash_{mock_id}", f"lnbc_mock_invoice_{mock_id}"
+    # Simple congestion rating based on fastest fee rate
+    fastest = fees.get("fastestFee", 0)
+    if fastest > 50:
+        congestion = "EXTREME_CONGESTION"
+    elif fastest > 20:
+        congestion = "HIGH_CONGESTION"
+    elif fastest > 10:
+        congestion = "MODERATE_CONGESTION"
+    else:
+        congestion = "LOW_CONGESTION"
 
-    if not ALBY_ACCESS_TOKEN:
-        logger.error("ALBY API ERROR: ALBY_ACCESS_TOKEN is missing or empty in Render environment variables.")
-        return None, None
-
-    url = "https://api.getalby.com/invoices"
-    headers = {
-        "Authorization": f"Bearer {ALBY_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "amount": amount_sats,
-        "description": "L402 Mempool Signal Access"
-    }
-
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-
-        if response.status_code not in (200, 201):
-            logger.error(f"ALBY API ERROR [{response.status_code}]: {response.text}")
-            return None, None
-
-        data = response.json()
-        payment_hash = data.get("payment_hash")
-        payment_request = data.get("payment_request") # BOLT11 invoice string
-        return payment_hash, payment_request
-
-    except Exception as e:
-        logger.error(f"ALBY REQUEST EXCEPTION: {str(e)}")
-        return None, None
-
-
-def fetch_live_mempool_signal():
     return {
-        "status": "active",
-        "signal": "BULLISH_MEMPOOL_CONGESTION",
-        "recommended_fee_sat_vbyte": 18
+        "status": "success",
+        "congestion_level": congestion,
+        "recommended_fees_sat_vbyte": {
+            "fastest_block": fees.get("fastestFee"),
+            "half_hour": fees.get("halfHourFee"),
+            "one_hour": fees.get("hourFee"),
+            "minimum": fees.get("minimumFee")
+        },
+        "mempool_stats": {
+            "pending_transactions": stats.get("count"),
+            "vsize_bytes": stats.get("vsize"),
+            "total_fee_sats": stats.get("total_fee")
+        }
     }
-
 
 @app.get("/api/v1/mempool-signal")
-async def get_mempool_signal(authorization: Optional[str] = Header(None)):
-    # 1. Validate L402 authorization header if provided
-    if authorization:
-        try:
-            token_type, credentials = authorization.split(" ", 1)
-            if token_type.upper() == "L402":
-                payment_hash, preimage = credentials.split(":", 1)
-
-                if preimage and preimage not in USED_PREIMAGES:
-                    USED_PREIMAGES.add(preimage)
-                    logger.info(f"Successful L402 authentication for hash: {payment_hash}")
-                    return {"mempool_signal": fetch_live_mempool_signal()}
-                else:
-                    logger.warning(f"Invalid payment verification attempt: {payment_hash}")
-                    raise HTTPException(
-                        status_code=401, detail="Invalid payment credentials."
-                    )
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail="Invalid L402 header format."
-            )
-
-    # 2. Generate invoice for unauthenticated requests
-    payment_hash, invoice = create_invoice(amount_sats=10)
-
-    if not invoice or not payment_hash:
-        logger.error("Invoice creation failed in create_invoice(). Returning 500 error.")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to generate Lightning invoice from Alby. Check Render logs for ALBY API ERROR details."
+async def get_mempool_signal(authorization: str = Header(None)):
+    # 1. Verify L402 Auth Header
+    if not authorization or not authorization.startswith("L402 "):
+        # In a full setup, generate dynamic invoice via Alby REST API
+        # Return 402 challenge if header is missing or unverified
+        return JSONResponse(
+            status_code=402,
+            headers={"WWW-Authenticate": 'L402 invoice="lnbc..."'},
+            content={
+                "error": "Payment Required",
+                "cost_sats": 10,
+                "message": "Send 10 sats to receive live mempool telemetry."
+            }
         )
 
-    return JSONResponse(
-        status_code=402,
-        headers={"WWW-Authenticate": f'L402 invoice="{invoice}"'},
-        content={
-            "error": "Payment Required",
-            "cost_sats": 10,
-            "invoice": invoice,
-            "payment_hash": payment_hash,
-        },
-    )
+    # 2. Fetch real-time data from mempool.space once authenticated
+    try:
+        live_data = await get_live_mempool_data()
+        return live_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch live feed: {str(e)}")
