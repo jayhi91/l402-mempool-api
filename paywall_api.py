@@ -8,7 +8,11 @@ app = FastAPI(title="L402 Live Mempool API")
 ALBY_ACCESS_TOKEN = os.getenv("ALBY_ACCESS_TOKEN")
 
 async def create_alby_invoice(amount_sats: int = 10):
-    """Generates a mainnet invoice from Alby Hub."""
+    """Generates a mainnet invoice from Alby API."""
+    if not ALBY_ACCESS_TOKEN:
+        print("[ERROR] ALBY_ACCESS_TOKEN environment variable is missing on Render!")
+        return None
+
     url = "https://api.getalby.com/invoices"
     headers = {
         "Authorization": f"Bearer {ALBY_ACCESS_TOKEN}",
@@ -18,12 +22,18 @@ async def create_alby_invoice(amount_sats: int = 10):
         "amount": amount_sats,
         "description": "L402 Telemetry Payment"
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        if resp.status_code != 200:
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            print(f"[ALBY API] Status: {resp.status_code}, Response: {resp.text}")
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("payment_request")
             return None
-        data = resp.json()
-        return data.get("payment_request")
+    except Exception as e:
+        print(f"[ALBY API EXCEPTION] {str(e)}")
+        return None
 
 async def get_live_mempool_data():
     """Fetches real-time fee and mempool statistics from mempool.space."""
@@ -61,7 +71,7 @@ async def get_mempool_signal(authorization: str = Header(None)):
         if not invoice:
             return JSONResponse(
                 status_code=500,
-                content={"error": "Failed to generate Lightning invoice from Alby Hub."}
+                content={"error": "Failed to generate Lightning invoice from Alby Hub. Check ALBY_ACCESS_TOKEN on Render."}
             )
         return JSONResponse(
             status_code=402,
@@ -78,4 +88,3 @@ async def get_mempool_signal(authorization: str = Header(None)):
         return await get_live_mempool_data()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch live data: {str(e)}")
-
