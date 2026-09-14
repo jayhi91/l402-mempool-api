@@ -92,3 +92,29 @@ def get_mempool_signal(authorization: str = Header(None)):
             "price_sats": 10
         }
     )
+def create_alby_invoice(amount_sats: int = 10, memo: str = "L402 Mempool Signal"):
+    """Generates a real BOLT11 invoice via Alby API."""
+    if not ALBY_ACCESS_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="ALBY_ACCESS_TOKEN environment variable is missing on Render."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {ALBY_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {"amount": amount_sats, "memo": memo}
+    
+    try:
+        resp = httpx.post(f"{ALBY_API_URL}/invoices", json=payload, headers=headers, timeout=5.0)
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return data.get("payment_request"), data.get("payment_hash")
+        
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Alby API Error ({resp.status_code}): {resp.text}"
+        )
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Alby Request Exception: {str(err)}")
