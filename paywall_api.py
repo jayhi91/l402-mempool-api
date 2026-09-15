@@ -1,123 +1,112 @@
-import hashlib
 import os
+import re
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Response, status
 
-app = FastAPI()
-
-ALBY_ACCESS_TOKEN = os.getenv("ALBY_ACCESS_TOKEN", "")
+API_URL = "https://l402-mempool-api.onrender.com/api/v1/mempool-signal"
 ALBY_API_URL = "https://api.getalby.com"
+ALBY_ACCESS_TOKEN = os.getenv("ALBY_ACCESS_TOKEN", "")
 
 
-def create_alby_invoice(amount_sats: int = 10, memo: str = "L402 Mempool Signal"):
-    """Generates a BOLT11 invoice via Alby REST API."""
+def parse_l402_header(www_authenticate_header: str):
+    if not www_authenticate_header:
+        return None, None
+    invoice_match = re.search(r'invoice="([^"]+)"', www_authenticate_header)
+    hash_match = re.search(r'payment_hash="([^"]+)"', www_authenticate_header)
+    return (
+        invoice_match.group(1) if invoice_match else None,
+        hash_match.group(1) if hash_match else None,
+    )
+
+
+def pay_invoice_via_alby(invoice: str, token: str):
     headers = {
-        "Authorization": f"Bearer {ALBY_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "amount": amount_sats,
-        "description": memo,
-    }
+    payload = {"invoice": invoice}
 
-    with httpx.Client(timeout=15.0) as client:
-        resp = client.post(f"{ALBY_API_URL}/invoices", json=payload, headers=headers)
+    print("Sending automated payment request to Alby...")
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"{ALBY_API_URL}/payments/bolt11", json=payload, headers=headers
+        )
+
         if resp.status_code in (200, 201):
             data = resp.json()
-            invoice = data.get("payment_request")
-            payment_hash = data.get("payment_hash")
-            return invoice, payment_hash
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to create Alby invoice: {resp.text}",
-            )
-
-
-def verify_l402_proof(authorization: str | None) -> tuple[bool, str]:
-    """Validates the L402 Authorization header."""
-    if not authorization:
-        return False, "Missing Authorization header"
-
-    auth_str = authorization.strip()
-    if auth_str.startswith("L402 "):
-        token_data = auth_str[5:].strip()
-    elif auth_str.startswith("LSAT "):
-        token_data = auth_str[5:].strip()
-    else:
-        return False, "Header format must be 'L402 <preimage>:<payment_hash>'"
-
-    try:
-        preimage_hex, payment_hash_hex = token_data.split(":", 1)
-    except ValueError:
-        return False, "Malformed L402 token format"
-
-    # Step 1: Local SHA-256 cryptographic check
-    try:
-        preimage_bytes = bytes.fromhex(preimage_hex)
-        computed_hash = hashlib.sha256(preimage_bytes).hexdigest()
-        if computed_hash.lower() != payment_hash_hex.lower():
-            return False, "SHA-256 hash of preimage does not match payment_hash"
-    except Exception:
-        return False, "Invalid hex encoding in preimage or hash"
-
-    # Step 2: Query Alby API to confirm invoice settlement status
-    try:
-        headers = {"Authorization": f"Bearer {ALBY_ACCESS_TOKEN}"}
-        url = f"{ALBY_API_URL}/invoices/{payment_hash_hex}"
-
-        with httpx.Client(timeout=10.0) as client:
-            resp = client.get(url, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                is_settled = (
-                    data.get("settled") is True or data.get("state") == "SETTLED"
+            preimage = (
+                data.get("payment_preimage")
+                or data.get("preimage")
+                or (
+                    data.get("payment", {}).get("payment_preimage")
+                    if isinstance(data.get("payment"), dict)
+                    else None
                 )
-                if is_settled:
-                    return True, payment_hash_hex
-                return False, "Invoice is generated but not yet settled"
-            else:
-                return False, f"Alby invoice check failed (HTTP {resp.status_code})"
-    except Exception as e:
-        return False, f"Error reaching Alby server: {str(e)}"
+            )
+            print("Payment settled successfully!")
+            return preimage
+        else:
+            raise Exception(f"Alby Payment Error ({resp.status_code}): {resp.text}")
 
 
-@app.get("/api/v1/mempool-signal")
-def get_mempool_signal(response: Response, authorization: str | None = Header(None)):
-    is_valid, result = verify_l402_proof(authorization)
+def fetch_gated_mempool_signal():
+    token = ALBY_ACCESS_TOKEN.strip()
+    if not token:
+        print("ERROR: ALBY_ACCESS_TOKEN environment variable is missing.")
+        return
 
-    if not is_valid:
-        # Generate a fresh invoice via Alby if payment is missing or invalid
-        invoice, payment_hash = create_alby_invoice(amount_sats=10)
+    with httpx.Client(timeout=60.0) as client:
+        print(f"Connecting to gated endpoint: {API_URL}")
+        res = client.get(API_URL)
 
-        # Set WWW-Authenticate header per L402 spec
-        response.headers["WWW-Authenticate"] = (
-            f'L402 invoice="{invoice}", payment_hash="{payment_hash}"'
-        )
+        if res.status_code == 402:
+            print("HTTP 402 Payment Required received.")
+            auth_header = res.headers.get("WWW-Authenticate") or ""
+            invoice, payment_hash = parse_l402_header(auth_header)
 
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                "detail": "Payment Required",
-                "invoice": invoice,
-                "payment_hash": payment_hash,
-                "price_sats": 10,
-                "reason": result,
-            },
-        )
+            # Fallback parsing for FastAPI nested response format: {"detail": {"invoice": ...}}
+            if not invoice or not payment_hash:
+                try:
+                    body = res.json()
+                    detail = (
+                        body.get("detail", {})
+                        if isinstance(body.get("detail"), dict)
+                        else body
+                    )
+                    invoice = detail.get("invoice")
+                    payment_hash = detail.get("payment_hash")
+                except Exception:
+                    pass
 
-    # Return gated payload on valid L402 proof
-    return {
-        "status": "success",
-        "congestion_level": "LOW",
-        "recommended_fees_sat_vb": {
-            "fastestFee": 1,
-            "halfHourFee": 1,
-            "hourFee": 1,
-            "economyFee": 1,
-            "minimumFee": 1,
-        },
-        "mempool_txs": 80669,
-        "vsize_bytes": 41920560,
-        "total_fee_sats": 9366957,
-    }
+            if not invoice or not payment_hash:
+                print(
+                    f"ERROR: Could not parse invoice from response header or body.\nRaw Body: {res.text}"
+                )
+                return
+
+            print(f"Invoice Received: {invoice[:25]}...")
+            print(f"Payment Hash: {payment_hash}")
+
+            preimage = pay_invoice_via_alby(invoice, token)
+
+            if not preimage:
+                print("ERROR: Could not extract preimage from Alby response.")
+                return
+
+            print("Submitting L402 authorization credentials...")
+            l402_auth = f"L402 {preimage}:{payment_hash}"
+            auth_headers = {"Authorization": l402_auth}
+
+            final_res = client.get(API_URL, headers=auth_headers)
+            print(f"\nSTATUS: {final_res.status_code}")
+            print("--- Live Mempool Data Output ---")
+            print(final_res.json())
+
+        elif res.status_code == 200:
+            print("STATUS: 200 (Already authenticated)")
+            print(res.json())
+        else:
+            print(f"Request failed with status {res.status_code}: {res.text}")
+
+
+if __name__ == "__main__":
+    fetch_gated_mempool_signal()
