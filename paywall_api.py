@@ -9,15 +9,36 @@ ALBY_ACCESS_TOKEN = os.getenv("ALBY_ACCESS_TOKEN", "")
 ALBY_API_URL = "https://api.getalby.com"
 
 
+def create_alby_invoice(amount_sats: int = 10, memo: str = "L402 Mempool Signal"):
+    """Generates a BOLT11 invoice via Alby REST API."""
+    headers = {
+        "Authorization": f"Bearer {ALBY_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "amount": amount_sats,
+        "description": memo,
+    }
+
+    with httpx.Client(timeout=15.0) as client:
+        resp = client.post(f"{ALBY_API_URL}/invoices", json=payload, headers=headers)
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            invoice = data.get("payment_request")
+            payment_hash = data.get("payment_hash")
+            return invoice, payment_hash
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create Alby invoice: {resp.text}",
+            )
+
+
 def verify_l402_proof(authorization: str | None) -> tuple[bool, str]:
-    """
-    Validates the L402 Authorization header.
-    Returns (is_valid, payment_hash_or_reason).
-    """
+    """Validates the L402 Authorization header."""
     if not authorization:
         return False, "Missing Authorization header"
 
-    # Support both L402 and LSAT prefix standards
     auth_str = authorization.strip()
     if auth_str.startswith("L402 "):
         token_data = auth_str[5:].strip()
@@ -49,7 +70,9 @@ def verify_l402_proof(authorization: str | None) -> tuple[bool, str]:
             resp = client.get(url, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
-                is_settled = data.get("settled") is True or data.get("state") == "SETTLED"
+                is_settled = (
+                    data.get("settled") is True or data.get("state") == "SETTLED"
+                )
                 if is_settled:
                     return True, payment_hash_hex
                 return False, "Invoice is generated but not yet settled"
