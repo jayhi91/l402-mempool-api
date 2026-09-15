@@ -3,7 +3,6 @@ import os
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Response, status
 
-# MUST be instantiated at top level as 'app' for Uvicorn/Render
 app = FastAPI()
 
 ALBY_ACCESS_TOKEN = os.getenv("ALBY_ACCESS_TOKEN", "")
@@ -36,7 +35,7 @@ def create_alby_invoice(amount_sats: int = 10, memo: str = "L402 Mempool Signal"
 
 
 def verify_l402_proof(authorization: str | None) -> tuple[bool, str]:
-    """Validates the L402 Authorization header."""
+    """Validates the L402 Authorization header using SHA-256 cryptographic proof."""
     if not authorization:
         return False, "Missing Authorization header"
 
@@ -53,34 +52,15 @@ def verify_l402_proof(authorization: str | None) -> tuple[bool, str]:
     except ValueError:
         return False, "Malformed L402 token format"
 
-    # Step 1: Local SHA-256 cryptographic check
+    # L402 Cryptographic Check: SHA-256(preimage) == payment_hash
     try:
         preimage_bytes = bytes.fromhex(preimage_hex)
         computed_hash = hashlib.sha256(preimage_bytes).hexdigest()
-        if computed_hash.lower() != payment_hash_hex.lower():
-            return False, "SHA-256 hash of preimage does not match payment_hash"
+        if computed_hash.lower() == payment_hash_hex.lower():
+            return True, payment_hash_hex
+        return False, "SHA-256 hash of preimage does not match payment_hash"
     except Exception:
         return False, "Invalid hex encoding in preimage or hash"
-
-    # Step 2: Query Alby API to confirm invoice settlement status
-    try:
-        headers = {"Authorization": f"Bearer {ALBY_ACCESS_TOKEN}"}
-        url = f"{ALBY_API_URL}/invoices/{payment_hash_hex}"
-
-        with httpx.Client(timeout=10.0) as client:
-            resp = client.get(url, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                is_settled = (
-                    data.get("settled") is True or data.get("state") == "SETTLED"
-                )
-                if is_settled:
-                    return True, payment_hash_hex
-                return False, "Invoice is generated but not yet settled"
-            else:
-                return False, f"Alby invoice check failed (HTTP {resp.status_code})"
-    except Exception as e:
-        return False, f"Error reaching Alby server: {str(e)}"
 
 
 @app.get("/api/v1/mempool-signal")
@@ -88,10 +68,8 @@ def get_mempool_signal(response: Response, authorization: str | None = Header(No
     is_valid, result = verify_l402_proof(authorization)
 
     if not is_valid:
-        # Generate fresh invoice via Alby
         invoice, payment_hash = create_alby_invoice(amount_sats=10)
 
-        # Set WWW-Authenticate header per L402 spec
         response.headers["WWW-Authenticate"] = (
             f'L402 invoice="{invoice}", payment_hash="{payment_hash}"'
         )
