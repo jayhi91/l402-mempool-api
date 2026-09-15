@@ -1,8 +1,3 @@
-
-Jake Dewees <jake199161@gmail.com>
-3:17 AM (0 minutes ago)
-to me
-
 import hashlib
 import os
 import httpx
